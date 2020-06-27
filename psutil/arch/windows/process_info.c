@@ -9,501 +9,32 @@
 
 #include <Python.h>
 #include <windows.h>
-#include <Psapi.h>
-#include <tlhelp32.h>
 
-#include "security.h"
-#include "process_info.h"
-#include "ntextapi.h"
 #include "../../_psutil_common.h"
+#include "process_info.h"
+#include "process_utils.h"
 
 
-// ====================================================================
-// Helper structures to access the memory correctly.
-// Some of these might also be defined in the winternl.h header file
-// but unfortunately not in a usable way.
-// ====================================================================
-
-// see http://msdn2.microsoft.com/en-us/library/aa489609.aspx
-#ifndef NT_SUCCESS
-#define NT_SUCCESS(Status) ((NTSTATUS)(Status) >= 0)
-#endif
-
-// http://msdn.microsoft.com/en-us/library/aa813741(VS.85).aspx
-typedef struct {
-    BYTE Reserved1[16];
-    PVOID Reserved2[5];
-    UNICODE_STRING CurrentDirectoryPath;
-    PVOID CurrentDirectoryHandle;
-    UNICODE_STRING DllPath;
-    UNICODE_STRING ImagePathName;
-    UNICODE_STRING CommandLine;
-    LPCWSTR env;
-} RTL_USER_PROCESS_PARAMETERS_, *PRTL_USER_PROCESS_PARAMETERS_;
-
-// https://msdn.microsoft.com/en-us/library/aa813706(v=vs.85).aspx
-#ifdef _WIN64
-typedef struct {
-    BYTE Reserved1[2];
-    BYTE BeingDebugged;
-    BYTE Reserved2[21];
-    PVOID LoaderData;
-    PRTL_USER_PROCESS_PARAMETERS_ ProcessParameters;
-    /* More fields ...  */
-} PEB_;
-#else
-typedef struct {
-    BYTE Reserved1[2];
-    BYTE BeingDebugged;
-    BYTE Reserved2[1];
-    PVOID Reserved3[2];
-    PVOID Ldr;
-    PRTL_USER_PROCESS_PARAMETERS_ ProcessParameters;
-    /* More fields ...  */
-} PEB_;
-#endif
-
-#ifdef _WIN64
-/* When we are a 64 bit process accessing a 32 bit (WoW64) process we need to
-   use the 32 bit structure layout. */
-typedef struct {
-    USHORT Length;
-    USHORT MaxLength;
-    DWORD Buffer;
-} UNICODE_STRING32;
-
-typedef struct {
-    BYTE Reserved1[16];
-    DWORD Reserved2[5];
-    UNICODE_STRING32 CurrentDirectoryPath;
-    DWORD CurrentDirectoryHandle;
-    UNICODE_STRING32 DllPath;
-    UNICODE_STRING32 ImagePathName;
-    UNICODE_STRING32 CommandLine;
-    DWORD env;
-} RTL_USER_PROCESS_PARAMETERS32;
-
-typedef struct {
-    BYTE Reserved1[2];
-    BYTE BeingDebugged;
-    BYTE Reserved2[1];
-    DWORD Reserved3[2];
-    DWORD Ldr;
-    DWORD ProcessParameters;
-    /* More fields ...  */
-} PEB32;
-#else
-/* When we are a 32 bit (WoW64) process accessing a 64 bit process we need to
-   use the 64 bit structure layout and a special function to read its memory.
-   */
-typedef NTSTATUS (NTAPI *_NtWow64ReadVirtualMemory64)(
-        IN HANDLE ProcessHandle,
-        IN PVOID64 BaseAddress,
-        OUT PVOID Buffer,
-        IN ULONG64 Size,
-        OUT PULONG64 NumberOfBytesRead);
-
-typedef enum {
-    MemoryInformationBasic
-} MEMORY_INFORMATION_CLASS;
-
-typedef NTSTATUS (NTAPI *_NtWow64QueryVirtualMemory64)(
-    IN HANDLE ProcessHandle,
-    IN PVOID64 BaseAddress,
-    IN MEMORY_INFORMATION_CLASS MemoryInformationClass,
-    OUT PMEMORY_BASIC_INFORMATION64 MemoryInformation,
-    IN ULONG64 Size,
-    OUT PULONG64 ReturnLength OPTIONAL);
-
-typedef struct {
-    PVOID Reserved1[2];
-    PVOID64 PebBaseAddress;
-    PVOID Reserved2[4];
-    PVOID UniqueProcessId[2];
-    PVOID Reserved3[2];
-} PROCESS_BASIC_INFORMATION64;
-
-typedef struct {
-    USHORT Length;
-    USHORT MaxLength;
-    PVOID64 Buffer;
-} UNICODE_STRING64;
-
-typedef struct {
-    BYTE Reserved1[16];
-    PVOID64 Reserved2[5];
-    UNICODE_STRING64 CurrentDirectoryPath;
-    PVOID64 CurrentDirectoryHandle;
-    UNICODE_STRING64 DllPath;
-    UNICODE_STRING64 ImagePathName;
-    UNICODE_STRING64 CommandLine;
-    PVOID64 env;
-} RTL_USER_PROCESS_PARAMETERS64;
-
-typedef struct {
-    BYTE Reserved1[2];
-    BYTE BeingDebugged;
-    BYTE Reserved2[21];
-    PVOID64 LoaderData;
-    PVOID64 ProcessParameters;
-    /* More fields ...  */
-} PEB64;
+#ifndef _WIN64
+typedef NTSTATUS (NTAPI *__NtQueryInformationProcess)(
+    HANDLE ProcessHandle,
+    DWORD ProcessInformationClass,
+    PVOID ProcessInformation,
+    DWORD ProcessInformationLength,
+    PDWORD ReturnLength);
 #endif
 
 
-#define PSUTIL_FIRST_PROCESS(Processes) ( \
-    (PSYSTEM_PROCESS_INFORMATION)(Processes))
-#define PSUTIL_NEXT_PROCESS(Process) ( \
-   ((PSYSTEM_PROCESS_INFORMATION)(Process))->NextEntryOffset ? \
-   (PSYSTEM_PROCESS_INFORMATION)((PCHAR)(Process) + \
-        ((PSYSTEM_PROCESS_INFORMATION)(Process))->NextEntryOffset) : NULL)
-
-const int STATUS_INFO_LENGTH_MISMATCH = 0xC0000004;
-const int STATUS_BUFFER_TOO_SMALL = 0xC0000023L;
-
-#define WINDOWS_UNINITIALIZED 0
-#define WINDOWS_XP 51
-#define WINDOWS_VISTA 60
-#define WINDOWS_7 61
-#define WINDOWS_8 62
-#define WINDOWS_81 63
-#define WINDOWS_10 100
-
-
-int get_windows_version() {
-    OSVERSIONINFO ver_info;
-    BOOL result;
-    DWORD dwMajorVersion;
-    DWORD dwMinorVersion;
-    DWORD dwBuildNumber;
-    static int windows_version = WINDOWS_UNINITIALIZED;
-    // windows_version is static
-    // and equal to WINDOWS_UNINITIALIZED only on first call
-    if (windows_version == WINDOWS_UNINITIALIZED) {
-        memset(&ver_info, 0, sizeof(ver_info));
-        ver_info.dwOSVersionInfoSize = sizeof(OSVERSIONINFO);
-        result = GetVersionEx(&ver_info);
-        if (result != FALSE) {
-            dwMajorVersion = ver_info.dwMajorVersion;
-            dwMinorVersion = ver_info.dwMinorVersion;
-            dwBuildNumber = ver_info.dwBuildNumber;
-            // Windows XP, Windows server 2003
-            if (dwMajorVersion == 5 && dwMinorVersion == 1) {
-                windows_version = WINDOWS_XP;
-            }
-            // Windows Vista
-            else if (dwMajorVersion == 6 && dwMinorVersion == 0) {
-                windows_version = WINDOWS_VISTA;
-            }
-            // Windows 7, Windows Server 2008 R2
-            else if (dwMajorVersion == 6 && dwMinorVersion == 1) {
-                windows_version = WINDOWS_7;
-            }
-            // Windows 8, Windows Server 2012
-            else if (dwMajorVersion == 6 && dwMinorVersion == 2) {
-                windows_version = WINDOWS_8;
-            }
-            // Windows 8.1, Windows Server 2012 R2
-            else if (dwMajorVersion == 6 && dwMinorVersion == 3)
-            {
-                windows_version = WINDOWS_81;
-            }
-            // Windows 10, Windows Server 2016
-            else if (dwMajorVersion == 10) {
-                windows_version = WINDOWS_10;
-            }
-        }
-    }
-    return windows_version;
-}
-
-
-_NtQueryInformationProcess psutil_NtQueryInformationProcess() {
-    static _NtQueryInformationProcess NtQueryInformationProcess = NULL;
-    if (NtQueryInformationProcess == NULL) {
-        NtQueryInformationProcess = (_NtQueryInformationProcess)GetProcAddress(
-            GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
-    }
-    return NtQueryInformationProcess;
-}
-
-
-// ====================================================================
-// Process and PIDs utiilties.
-// ====================================================================
-
-
 /*
- * Return 1 if PID exists, 0 if not, -1 on error.
+ * Given a pointer into a process's memory, figure out how much
+ * data can be read from it.
  */
-int
-psutil_pid_in_pids(DWORD pid) {
-    DWORD *proclist = NULL;
-    DWORD numberOfReturnedPIDs;
-    DWORD i;
-
-    proclist = psutil_get_pids(&numberOfReturnedPIDs);
-    if (proclist == NULL)
-        return -1;
-    for (i = 0; i < numberOfReturnedPIDs; i++) {
-        if (proclist[i] == pid) {
-            free(proclist);
-            return 1;
-        }
-    }
-    free(proclist);
-    return 0;
-}
-
-
-/*
- * Given a process HANDLE checks whether it's actually running.
- * Returns:
- * - 1: running
- * - 0: not running
- * - -1: WindowsError
- * - -2: AssertionError
- */
-int
-psutil_is_phandle_running(HANDLE hProcess, DWORD pid) {
-    DWORD processExitCode = 0;
-
-    if (hProcess == NULL) {
-        if (GetLastError() == ERROR_INVALID_PARAMETER) {
-            // Yeah, this is the actual error code in case of
-            // "no such process".
-            if (! psutil_assert_pid_not_exists(
-                    pid, "iphr: OpenProcess() -> ERROR_INVALID_PARAMETER")) {
-                return -2;
-            }
-            return 0;
-        }
-        return -1;
-    }
-
-    if (GetExitCodeProcess(hProcess, &processExitCode)) {
-        // XXX - maybe STILL_ACTIVE is not fully reliable as per:
-        // http://stackoverflow.com/questions/1591342/#comment47830782_1591379
-        if (processExitCode == STILL_ACTIVE) {
-            if (! psutil_assert_pid_exists(
-                    pid, "iphr: GetExitCodeProcess() -> STILL_ACTIVE")) {
-                return -2;
-            }
-            return 1;
-        }
-        else {
-            // We can't be sure so we look into pids.
-            if (psutil_pid_in_pids(pid) == 1) {
-                return 1;
-            }
-            else {
-                CloseHandle(hProcess);
-                return 0;
-            }
-        }
-    }
-
-    CloseHandle(hProcess);
-    if (! psutil_assert_pid_not_exists( pid, "iphr: exit fun")) {
-        return -2;
-    }
-    return -1;
-}
-
-
-/*
- * Given a process HANDLE checks whether it's actually running and if
- * it does return it, else return NULL with the proper Python exception
- * set.
- */
-HANDLE
-psutil_check_phandle(HANDLE hProcess, DWORD pid) {
-    int ret = psutil_is_phandle_running(hProcess, pid);
-    if (ret == 1)
-        return hProcess;
-    else if (ret == 0)
-        return NoSuchProcess("");
-    else if (ret == -1)
-        return PyErr_SetFromWindowsErr(0);
-    else  // -2
-        return NULL;
-}
-
-
-/*
- * A wrapper around OpenProcess setting NSP exception if process
- * no longer exists.
- * "pid" is the process pid, "dwDesiredAccess" is the first argument
- * exptected by OpenProcess.
- * Return a process handle or NULL.
- */
-HANDLE
-psutil_handle_from_pid(DWORD pid, DWORD dwDesiredAccess) {
-    HANDLE hProcess;
-
-    if (pid == 0) {
-        // otherwise we'd get NoSuchProcess
-        return AccessDenied("");
-    }
-
-    hProcess = OpenProcess(dwDesiredAccess, FALSE, pid);
-    return psutil_check_phandle(hProcess, pid);
-}
-
-
-DWORD *
-psutil_get_pids(DWORD *numberOfReturnedPIDs) {
-    // Win32 SDK says the only way to know if our process array
-    // wasn't large enough is to check the returned size and make
-    // sure that it doesn't match the size of the array.
-    // If it does we allocate a larger array and try again
-
-    // Stores the actual array
-    DWORD *procArray = NULL;
-    DWORD procArrayByteSz;
-    int procArraySz = 0;
-
-    // Stores the byte size of the returned array from enumprocesses
-    DWORD enumReturnSz = 0;
-
-    do {
-        procArraySz += 1024;
-        if (procArray != NULL)
-            free(procArray);
-        procArrayByteSz = procArraySz * sizeof(DWORD);
-        procArray = malloc(procArrayByteSz);
-        if (procArray == NULL) {
-            PyErr_NoMemory();
-            return NULL;
-        }
-        if (! EnumProcesses(procArray, procArrayByteSz, &enumReturnSz)) {
-            free(procArray);
-            PyErr_SetFromWindowsErr(0);
-            return NULL;
-        }
-    } while (enumReturnSz == procArraySz * sizeof(DWORD));
-
-    // The number of elements is the returned size / size of each element
-    *numberOfReturnedPIDs = enumReturnSz / sizeof(DWORD);
-
-    return procArray;
-}
-
-
-int
-psutil_assert_pid_exists(DWORD pid, char *err) {
-    if (PSUTIL_TESTING) {
-        if (psutil_pid_in_pids(pid) == 0) {
-            PyErr_SetString(PyExc_AssertionError, err);
-            return 0;
-        }
-    }
-    return 1;
-}
-
-
-int
-psutil_assert_pid_not_exists(DWORD pid, char *err) {
-    if (PSUTIL_TESTING) {
-        if (psutil_pid_in_pids(pid) == 1) {
-            PyErr_SetString(PyExc_AssertionError, err);
-            return 0;
-        }
-    }
-    return 1;
-}
-
-
-/*
-/* Check for PID existance by using OpenProcess() + GetExitCodeProcess.
-/* Returns:
- * 1: pid exists
- * 0: it doesn't
- * -1: error
- */
-int
-psutil_pid_is_running(DWORD pid) {
-    HANDLE hProcess;
-    DWORD exitCode;
-    DWORD err;
-
-    // Special case for PID 0 System Idle Process
-    if (pid == 0)
-        return 1;
-    if (pid < 0)
-        return 0;
-    hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                           FALSE, pid);
-    if (NULL == hProcess) {
-        err = GetLastError();
-        // Yeah, this is the actual error code in case of "no such process".
-        if (err == ERROR_INVALID_PARAMETER) {
-            if (! psutil_assert_pid_not_exists(
-                    pid, "pir: OpenProcess() -> INVALID_PARAMETER")) {
-                return -1;
-            }
-            return 0;
-        }
-        // Access denied obviously means there's a process to deny access to.
-        else if (err == ERROR_ACCESS_DENIED) {
-            if (! psutil_assert_pid_exists(
-                    pid, "pir: OpenProcess() ACCESS_DENIED")) {
-                return -1;
-            }
-            return 1;
-        }
-        // Be strict and raise an exception; the caller is supposed
-        // to take -1 into account.
-        else {
-            PyErr_SetFromWindowsErr(err);
-            return -1;
-        }
-    }
-
-    if (GetExitCodeProcess(hProcess, &exitCode)) {
-        CloseHandle(hProcess);
-        // XXX - maybe STILL_ACTIVE is not fully reliable as per:
-        // http://stackoverflow.com/questions/1591342/#comment47830782_1591379
-        if (exitCode == STILL_ACTIVE) {
-            if (! psutil_assert_pid_exists(
-                    pid, "pir: GetExitCodeProcess() -> STILL_ACTIVE")) {
-                return -1;
-            }
-            return 1;
-        }
-        // We can't be sure so we look into pids.
-        else {
-            return psutil_pid_in_pids(pid);
-        }
-    }
-    else {
-        err = GetLastError();
-        CloseHandle(hProcess);
-        // Same as for OpenProcess, assume access denied means there's
-        // a process to deny access to.
-        if (err == ERROR_ACCESS_DENIED) {
-            if (! psutil_assert_pid_exists(
-                    pid, "pir: GetExitCodeProcess() -> ERROR_ACCESS_DENIED")) {
-                return -1;
-            }
-            return 1;
-        }
-        else {
-            PyErr_SetFromWindowsErr(err);
-            return -1;
-        }
-    }
-}
-
-
-/* Given a pointer into a process's memory, figure out how much data can be
- * read from it. */
 static int
 psutil_get_process_region_size(HANDLE hProcess, LPCVOID src, SIZE_T *psize) {
     MEMORY_BASIC_INFORMATION info;
 
     if (!VirtualQueryEx(hProcess, src, &info, sizeof(info))) {
-        PyErr_SetFromWindowsErr(0);
+        PyErr_SetFromOSErrnoWithSyscall("VirtualQueryEx");
         return -1;
     }
 
@@ -512,60 +43,22 @@ psutil_get_process_region_size(HANDLE hProcess, LPCVOID src, SIZE_T *psize) {
 }
 
 
-#ifndef _WIN64
-/* Given a pointer into a process's memory, figure out how much data can be
- * read from it. */
-static int
-psutil_get_process_region_size64(HANDLE hProcess,
-                                 const PVOID64 src64,
-                                 PULONG64 psize) {
-    static _NtWow64QueryVirtualMemory64 NtWow64QueryVirtualMemory64 = NULL;
-    MEMORY_BASIC_INFORMATION64 info64;
-
-    if (NtWow64QueryVirtualMemory64 == NULL) {
-        NtWow64QueryVirtualMemory64 =
-            (_NtWow64QueryVirtualMemory64)GetProcAddress(
-                    GetModuleHandleA("ntdll.dll"),
-                    "NtWow64QueryVirtualMemory64");
-
-        if (NtWow64QueryVirtualMemory64 == NULL) {
-            PyErr_SetString(PyExc_NotImplementedError,
-                    "NtWow64QueryVirtualMemory64 missing");
-            return -1;
-        }
-    }
-
-    if (!NT_SUCCESS(NtWow64QueryVirtualMemory64(
-                    hProcess,
-                    src64,
-                    0,
-                    &info64,
-                    sizeof(info64),
-                    NULL))) {
-        PyErr_SetFromWindowsErr(0);
-        return -1;
-    }
-
-    *psize = info64.RegionSize - ((char*)src64 - (char*)info64.BaseAddress);
-    return 0;
-}
-#endif
-
-
 enum psutil_process_data_kind {
     KIND_CMDLINE,
     KIND_CWD,
     KIND_ENVIRON,
 };
 
-/* Get data from the process with the given pid.  The data is returned in the
-   pdata output member as a nul terminated string which must be freed on
-   success.
 
-   On success 0 is returned.  On error the output parameter is not touched, -1
-   is returned, and an appropriate Python exception is set. */
+/*
+ * Get data from the process with the given pid.  The data is returned
+ * in the pdata output member as a nul terminated string which must be
+ * freed on success.
+ * On success 0 is returned.  On error the output parameter is not touched,
+ * -1 is returned, and an appropriate Python exception is set.
+ */
 static int
-psutil_get_process_data(long pid,
+psutil_get_process_data(DWORD pid,
                         enum psutil_process_data_kind kind,
                         WCHAR **pdata,
                         SIZE_T *psize) {
@@ -593,14 +86,13 @@ psutil_get_process_data(long pid,
          http://stackoverflow.com/a/14012919
          http://www.drdobbs.com/embracing-64-bit-windows/184401966
      */
-    _NtQueryInformationProcess NtQueryInformationProcess = NULL;
+    SIZE_T size = 0;
 #ifndef _WIN64
-    static _NtQueryInformationProcess NtWow64QueryInformationProcess64 = NULL;
+    static __NtQueryInformationProcess NtWow64QueryInformationProcess64 = NULL;
     static _NtWow64ReadVirtualMemory64 NtWow64ReadVirtualMemory64 = NULL;
 #endif
     HANDLE hProcess = NULL;
     LPCVOID src;
-    SIZE_T size;
     WCHAR *buffer = NULL;
 #ifdef _WIN64
     LPVOID ppeb32 = NULL;
@@ -610,22 +102,25 @@ psutil_get_process_data(long pid,
     BOOL theyAreWow64;
 #endif
     DWORD access = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ;
+    NTSTATUS status;
 
     hProcess = psutil_handle_from_pid(pid, access);
     if (hProcess == NULL)
         return -1;
 
-    NtQueryInformationProcess = psutil_NtQueryInformationProcess();
-
 #ifdef _WIN64
     /* 64 bit case.  Check if the target is a 32 bit process running in WoW64
      * mode. */
-    if (!NT_SUCCESS(NtQueryInformationProcess(hProcess,
-                                              ProcessWow64Information,
-                                              &ppeb32,
-                                              sizeof(LPVOID),
-                                              NULL))) {
-        PyErr_SetFromWindowsErr(0);
+    status = NtQueryInformationProcess(
+        hProcess,
+        ProcessWow64Information,
+        &ppeb32,
+        sizeof(LPVOID),
+        NULL);
+
+    if (!NT_SUCCESS(status)) {
+        psutil_SetFromNTStatusErr(
+            status, "NtQueryInformationProcess(ProcessWow64Information)");
         goto error;
     }
 
@@ -636,16 +131,21 @@ psutil_get_process_data(long pid,
 
         // read PEB
         if (!ReadProcessMemory(hProcess, ppeb32, &peb32, sizeof(peb32), NULL)) {
+            // May fail with ERROR_PARTIAL_COPY, see:
+            // https://github.com/giampaolo/psutil/issues/875
             PyErr_SetFromWindowsErr(0);
             goto error;
         }
 
         // read process parameters
         if (!ReadProcessMemory(hProcess,
-                              UlongToPtr(peb32.ProcessParameters),
-                              &procParameters32,
-                              sizeof(procParameters32),
-                              NULL)) {
+                               UlongToPtr(peb32.ProcessParameters),
+                               &procParameters32,
+                               sizeof(procParameters32),
+                               NULL))
+        {
+            // May fail with ERROR_PARTIAL_COPY, see:
+            // https://github.com/giampaolo/psutil/issues/875
             PyErr_SetFromWindowsErr(0);
             goto error;
         }
@@ -667,8 +167,8 @@ psutil_get_process_data(long pid,
 #else
     /* 32 bit case.  Check if the target is also 32 bit. */
     if (!IsWow64Process(GetCurrentProcess(), &weAreWow64) ||
-        !IsWow64Process(hProcess, &theyAreWow64)) {
-        PyErr_SetFromWindowsErr(0);
+            !IsWow64Process(hProcess, &theyAreWow64)) {
+        PyErr_SetFromOSErrnoWithSyscall("IsWow64Process");
         goto error;
     }
 
@@ -679,58 +179,64 @@ psutil_get_process_data(long pid,
         RTL_USER_PROCESS_PARAMETERS64 procParameters64;
 
         if (NtWow64QueryInformationProcess64 == NULL) {
-            NtWow64QueryInformationProcess64 =
-                (_NtQueryInformationProcess)GetProcAddress(
-                        GetModuleHandleA("ntdll.dll"),
-                        "NtWow64QueryInformationProcess64");
-
+            NtWow64QueryInformationProcess64 = \
+                psutil_GetProcAddressFromLib(
+                    "ntdll.dll", "NtWow64QueryInformationProcess64");
             if (NtWow64QueryInformationProcess64 == NULL) {
-                PyErr_SetString(PyExc_NotImplementedError,
-                                "NtWow64QueryInformationProcess64 missing");
+                PyErr_Clear();
+                AccessDenied("can't query 64-bit process in 32-bit-WoW mode");
+                goto error;
+            }
+        }
+        if (NtWow64ReadVirtualMemory64 == NULL) {
+            NtWow64ReadVirtualMemory64 = \
+                psutil_GetProcAddressFromLib(
+                    "ntdll.dll", "NtWow64ReadVirtualMemory64");
+            if (NtWow64ReadVirtualMemory64 == NULL) {
+                PyErr_Clear();
+                AccessDenied("can't query 64-bit process in 32-bit-WoW mode");
                 goto error;
             }
         }
 
-        if (!NT_SUCCESS(NtWow64QueryInformationProcess64(
-                        hProcess,
-                        ProcessBasicInformation,
-                        &pbi64,
-                        sizeof(pbi64),
-                        NULL))) {
-            PyErr_SetFromWindowsErr(0);
+        status = NtWow64QueryInformationProcess64(
+                hProcess,
+                ProcessBasicInformation,
+                &pbi64,
+                sizeof(pbi64),
+                NULL);
+        if (!NT_SUCCESS(status)) {
+            psutil_SetFromNTStatusErr(
+                    status,
+                    "NtWow64QueryInformationProcess64(ProcessBasicInformation)"
+            );
             goto error;
         }
 
         // read peb
-        if (NtWow64ReadVirtualMemory64 == NULL) {
-            NtWow64ReadVirtualMemory64 =
-                (_NtWow64ReadVirtualMemory64)GetProcAddress(
-                        GetModuleHandleA("ntdll.dll"),
-                        "NtWow64ReadVirtualMemory64");
-
-            if (NtWow64ReadVirtualMemory64 == NULL) {
-                PyErr_SetString(PyExc_NotImplementedError,
-                                "NtWow64ReadVirtualMemory64 missing");
-                goto error;
-            }
-        }
-
-        if (!NT_SUCCESS(NtWow64ReadVirtualMemory64(hProcess,
-                                                   pbi64.PebBaseAddress,
-                                                   &peb64,
-                                                   sizeof(peb64),
-                                                   NULL))) {
-            PyErr_SetFromWindowsErr(0);
+        status = NtWow64ReadVirtualMemory64(
+                hProcess,
+                pbi64.PebBaseAddress,
+                &peb64,
+                sizeof(peb64),
+                NULL);
+        if (!NT_SUCCESS(status)) {
+            psutil_SetFromNTStatusErr(status, "NtWow64ReadVirtualMemory64");
             goto error;
         }
 
         // read process parameters
-        if (!NT_SUCCESS(NtWow64ReadVirtualMemory64(hProcess,
-                                                   peb64.ProcessParameters,
-                                                   &procParameters64,
-                                                   sizeof(procParameters64),
-                                                   NULL))) {
-            PyErr_SetFromWindowsErr(0);
+        status = NtWow64ReadVirtualMemory64(
+                hProcess,
+                peb64.ProcessParameters,
+                &procParameters64,
+                sizeof(procParameters64),
+                NULL);
+        if (!NT_SUCCESS(status)) {
+            psutil_SetFromNTStatusErr(
+                    status,
+                    "NtWow64ReadVirtualMemory64(ProcessParameters)"
+            );
             goto error;
         }
 
@@ -749,28 +255,35 @@ psutil_get_process_data(long pid,
         }
     } else
 #endif
-
     /* Target process is of the same bitness as us. */
     {
         PROCESS_BASIC_INFORMATION pbi;
         PEB_ peb;
         RTL_USER_PROCESS_PARAMETERS_ procParameters;
 
-        if (!NT_SUCCESS(NtQueryInformationProcess(hProcess,
-                                                  ProcessBasicInformation,
-                                                  &pbi,
-                                                  sizeof(pbi),
-                                                  NULL))) {
-            PyErr_SetFromWindowsErr(0);
+        status = NtQueryInformationProcess(
+            hProcess,
+            ProcessBasicInformation,
+            &pbi,
+            sizeof(pbi),
+            NULL);
+
+        if (!NT_SUCCESS(status)) {
+            psutil_SetFromNTStatusErr(
+                status, "NtQueryInformationProcess(ProcessBasicInformation)");
             goto error;
         }
+
 
         // read peb
         if (!ReadProcessMemory(hProcess,
                                pbi.PebBaseAddress,
                                &peb,
                                sizeof(peb),
-                               NULL)) {
+                               NULL))
+        {
+            // May fail with ERROR_PARTIAL_COPY, see:
+            // https://github.com/giampaolo/psutil/issues/875
             PyErr_SetFromWindowsErr(0);
             goto error;
         }
@@ -780,7 +293,10 @@ psutil_get_process_data(long pid,
                                peb.ProcessParameters,
                                &procParameters,
                                sizeof(procParameters),
-                               NULL)) {
+                               NULL))
+        {
+            // May fail with ERROR_PARTIAL_COPY, see:
+            // https://github.com/giampaolo/psutil/issues/875
             PyErr_SetFromWindowsErr(0);
             goto error;
         }
@@ -803,12 +319,8 @@ psutil_get_process_data(long pid,
     if (kind == KIND_ENVIRON) {
 #ifndef _WIN64
         if (weAreWow64 && !theyAreWow64) {
-            ULONG64 size64;
-
-            if (psutil_get_process_region_size64(hProcess, src64, &size64) != 0)
-                goto error;
-
-            size = (SIZE_T)size64;
+            AccessDenied("can't query 64-bit process in 32-bit-WoW mode");
+            goto error;
         }
         else
 #endif
@@ -817,7 +329,6 @@ psutil_get_process_data(long pid,
     }
 
     buffer = calloc(size + 2, 1);
-
     if (buffer == NULL) {
         PyErr_NoMemory();
         goto error;
@@ -825,17 +336,21 @@ psutil_get_process_data(long pid,
 
 #ifndef _WIN64
     if (weAreWow64 && !theyAreWow64) {
-        if (!NT_SUCCESS(NtWow64ReadVirtualMemory64(hProcess,
-                                                   src64,
-                                                   buffer,
-                                                   size,
-                                                   NULL))) {
-            PyErr_SetFromWindowsErr(0);
+        status = NtWow64ReadVirtualMemory64(
+                hProcess,
+                src64,
+                buffer,
+                size,
+                NULL);
+        if (!NT_SUCCESS(status)) {
+            psutil_SetFromNTStatusErr(status, "NtWow64ReadVirtualMemory64");
             goto error;
         }
     } else
 #endif
     if (!ReadProcessMemory(hProcess, src, buffer, size, NULL)) {
+        // May fail with ERROR_PARTIAL_COPY, see:
+        // https://github.com/giampaolo/psutil/issues/875
         PyErr_SetFromWindowsErr(0);
         goto error;
     }
@@ -857,69 +372,93 @@ error:
 
 
 /*
- * Get process cmdline() by using NtQueryInformationProcess. This is
- * useful on Windows 8.1+ in order to get less ERROR_ACCESS_DENIED
- * errors when querying privileged PIDs.
+ * Get process cmdline by using NtQueryInformationProcess. This is a
+ * method alternative to PEB which is less likely to result in
+ * AccessDenied. Requires Windows 8.1+.
  */
 static int
-psutil_get_cmdline_data(long pid, WCHAR **pdata, SIZE_T *psize) {
-    HANDLE hProcess;
-    ULONG ret_length = 4096;
+psutil_cmdline_query_proc(DWORD pid, WCHAR **pdata, SIZE_T *psize) {
+    HANDLE hProcess = NULL;
+    ULONG bufLen = 0;
     NTSTATUS status;
-    char * cmdline_buffer = NULL;
-    WCHAR * cmdline_buffer_wchar = NULL;
+    char * buffer = NULL;
+    WCHAR * bufWchar = NULL;
     PUNICODE_STRING tmp = NULL;
-    DWORD string_size;
-    _NtQueryInformationProcess NtQueryInformationProcess = NULL;
+    size_t size;
+    int ProcessCommandLineInformation = 60;
 
-    NtQueryInformationProcess = psutil_NtQueryInformationProcess();
-    if (NtQueryInformationProcess == NULL) {
-        PyErr_SetFromWindowsErr(0);
-        goto error;
-    }
-
-    cmdline_buffer = calloc(ret_length, 1);
-    if (cmdline_buffer == NULL) {
-        PyErr_NoMemory();
+    if (PSUTIL_WINVER < PSUTIL_WINDOWS_8_1) {
+        PyErr_SetString(
+            PyExc_RuntimeError, "requires Windows 8.1+");
         goto error;
     }
 
     hProcess = psutil_handle_from_pid(pid, PROCESS_QUERY_LIMITED_INFORMATION);
-    if (hProcess == NULL) {
-        PyErr_SetFromWindowsErr(0);
+    if (hProcess == NULL)
         goto error;
-    }
+
+    // get the right buf size
     status = NtQueryInformationProcess(
         hProcess,
-        60, // ProcessCommandLineInformation
-        cmdline_buffer,
-        ret_length,
-        &ret_length
-    );
-    if (!NT_SUCCESS(status)) {
-        PyErr_SetFromWindowsErr(0);
+        ProcessCommandLineInformation,
+        NULL,
+        0,
+        &bufLen);
+
+    // https://github.com/giampaolo/psutil/issues/1501
+    if (status == STATUS_NOT_FOUND) {
+        AccessDenied("NtQueryInformationProcess(ProcessBasicInformation) -> "
+                     "STATUS_NOT_FOUND translated into PermissionError");
         goto error;
     }
 
-    tmp = (PUNICODE_STRING)cmdline_buffer;
-    string_size = wcslen(tmp->Buffer) + 1;
-    cmdline_buffer_wchar = (WCHAR *)calloc(string_size, sizeof(WCHAR));
+    if (status != STATUS_BUFFER_OVERFLOW && \
+            status != STATUS_BUFFER_TOO_SMALL && \
+            status != STATUS_INFO_LENGTH_MISMATCH) {
+        psutil_SetFromNTStatusErr(
+            status, "NtQueryInformationProcess(ProcessBasicInformation)");
+        goto error;
+    }
 
-    if (cmdline_buffer_wchar == NULL) {
+    // allocate memory
+    buffer = calloc(bufLen, 1);
+    if (buffer == NULL) {
         PyErr_NoMemory();
         goto error;
     }
 
-    wcscpy_s(cmdline_buffer_wchar, string_size, tmp->Buffer);
-    *pdata = cmdline_buffer_wchar;
-    *psize = string_size * sizeof(WCHAR);
-    free(cmdline_buffer);
+    // get the cmdline
+    status = NtQueryInformationProcess(
+        hProcess,
+        ProcessCommandLineInformation,
+        buffer,
+        bufLen,
+        &bufLen
+    );
+    if (!NT_SUCCESS(status)) {
+        psutil_SetFromNTStatusErr(
+            status, "NtQueryInformationProcess(ProcessCommandLineInformation)");
+        goto error;
+    }
+
+    // build the string
+    tmp = (PUNICODE_STRING)buffer;
+    size = wcslen(tmp->Buffer) + 1;
+    bufWchar = (WCHAR *)calloc(size, sizeof(WCHAR));
+    if (bufWchar == NULL) {
+        PyErr_NoMemory();
+        goto error;
+    }
+    wcscpy_s(bufWchar, size, tmp->Buffer);
+    *pdata = bufWchar;
+    *psize = size * sizeof(WCHAR);
+    free(buffer);
     CloseHandle(hProcess);
     return 0;
 
 error:
-    if (cmdline_buffer != NULL)
-        free(cmdline_buffer);
+    if (buffer != NULL)
+        free(buffer);
     if (hProcess != NULL)
         CloseHandle(hProcess);
     return -1;
@@ -931,7 +470,7 @@ error:
  * with given pid or NULL on error.
  */
 PyObject *
-psutil_get_cmdline(long pid, int use_peb) {
+psutil_get_cmdline(DWORD pid, int use_peb) {
     PyObject *ret = NULL;
     WCHAR *data = NULL;
     SIZE_T size;
@@ -939,36 +478,28 @@ psutil_get_cmdline(long pid, int use_peb) {
     PyObject *py_unicode = NULL;
     LPWSTR *szArglist = NULL;
     int nArgs, i;
-    int windows_version;
     int func_ret;
 
-    windows_version = get_windows_version();
     /*
-    By defaut, still use PEB (if command line params have been patched in
-    the PEB, we will get the actual ones). Reading the PEB to get the
-    command line parameters still seem to be the best method if somebody
-    has tampered with the parameters after creating the process.
+    Reading the PEB to get the cmdline seem to be the best method if
+    somebody has tampered with the parameters after creating the process.
     For instance, create a process as suspended, patch the command line
-    in its PEB and unfreeze it.
-    The process will use the "new" parameters whereas the system
-    (with NtQueryInformationProcess) will give you the "old" ones
-    See:
+    in its PEB and unfreeze it. It requires more privileges than
+    NtQueryInformationProcess though (the fallback):
     - https://github.com/giampaolo/psutil/pull/1398
     - https://blog.xpnsec.com/how-to-argue-like-cobalt-strike/
     */
-    if (use_peb == 1) {
+    if (use_peb == 1)
         func_ret = psutil_get_process_data(pid, KIND_CMDLINE, &data, &size);
-    }
-    else {
-        func_ret = psutil_get_cmdline_data(pid, &data, &size);
-    }
+    else
+        func_ret = psutil_cmdline_query_proc(pid, &data, &size);
     if (func_ret != 0)
         goto out;
 
     // attempt to parse the command line using Win32 API
     szArglist = CommandLineToArgvW(data, &nArgs);
     if (szArglist == NULL) {
-        PyErr_SetFromWindowsErr(0);
+        PyErr_SetFromOSErrnoWithSyscall("CommandLineToArgvW");
         goto out;
     }
 
@@ -1000,7 +531,7 @@ out:
 
 
 PyObject *
-psutil_get_cwd(long pid) {
+psutil_get_cwd(DWORD pid) {
     PyObject *ret = NULL;
     WCHAR *data = NULL;
     SIZE_T size;
@@ -1024,7 +555,7 @@ out:
  * process with given pid or NULL on error.
  */
 PyObject *
-psutil_get_environ(long pid) {
+psutil_get_environ(DWORD pid) {
     PyObject *ret = NULL;
     WCHAR *data = NULL;
     SIZE_T size;
@@ -1044,10 +575,11 @@ out:
 
 /*
  * Given a process PID and a PSYSTEM_PROCESS_INFORMATION structure
- * fills the structure with various process information by using
- * NtQuerySystemInformation.
+ * fills the structure with various process information in one shot
+ * by using NtQuerySystemInformation.
  * We use this as a fallback when faster functions fail with access
- * denied. This is slower because it iterates over all processes.
+ * denied. This is slower because it iterates over all processes
+ * but it doesn't require any privilege (also work for PID 0).
  * On success return 1, else 0 with Python exception already set.
  */
 int
@@ -1059,14 +591,6 @@ psutil_get_proc_info(DWORD pid, PSYSTEM_PROCESS_INFORMATION *retProcess,
     ULONG bufferSize;
     PSYSTEM_PROCESS_INFORMATION process;
 
-    // get NtQuerySystemInformation
-    typedef DWORD (_stdcall * NTQSI_PROC) (int, PVOID, ULONG, PULONG);
-    NTQSI_PROC NtQuerySystemInformation;
-    HINSTANCE hNtDll;
-    hNtDll = LoadLibrary(TEXT("ntdll.dll"));
-    NtQuerySystemInformation = (NTQSI_PROC)GetProcAddress(
-        hNtDll, "NtQuerySystemInformation");
-
     bufferSize = initialBufferSize;
     buffer = malloc(bufferSize);
     if (buffer == NULL) {
@@ -1075,9 +599,11 @@ psutil_get_proc_info(DWORD pid, PSYSTEM_PROCESS_INFORMATION *retProcess,
     }
 
     while (TRUE) {
-        status = NtQuerySystemInformation(SystemProcessInformation, buffer,
-                                          bufferSize, &bufferSize);
-
+        status = NtQuerySystemInformation(
+            SystemProcessInformation,
+            buffer,
+            bufferSize,
+            &bufferSize);
         if (status == STATUS_BUFFER_TOO_SMALL ||
                 status == STATUS_INFO_LENGTH_MISMATCH)
         {
@@ -1093,9 +619,9 @@ psutil_get_proc_info(DWORD pid, PSYSTEM_PROCESS_INFORMATION *retProcess,
         }
     }
 
-    if (status != 0) {
-        PyErr_Format(
-            PyExc_RuntimeError, "NtQuerySystemInformation() syscall failed");
+    if (! NT_SUCCESS(status)) {
+        psutil_SetFromNTStatusErr(
+            status, "NtQuerySystemInformation(SystemProcessInformation)");
         goto error;
     }
 
@@ -1104,19 +630,104 @@ psutil_get_proc_info(DWORD pid, PSYSTEM_PROCESS_INFORMATION *retProcess,
 
     process = PSUTIL_FIRST_PROCESS(buffer);
     do {
-        if (process->UniqueProcessId == (HANDLE)pid) {
+        if ((ULONG_PTR)process->UniqueProcessId == pid) {
             *retProcess = process;
             *retBuffer = buffer;
             return 1;
         }
-    } while ( (process = PSUTIL_NEXT_PROCESS(process)) );
+    } while ((process = PSUTIL_NEXT_PROCESS(process)));
 
-    NoSuchProcess("");
+    NoSuchProcess("NtQuerySystemInformation (no PID found)");
     goto error;
 
 error:
-    FreeLibrary(hNtDll);
     if (buffer != NULL)
         free(buffer);
     return 0;
+}
+
+
+/*
+ * Get various process information by using NtQuerySystemInformation.
+ * We use this as a fallback when faster functions fail with access
+ * denied. This is slower because it iterates over all processes.
+ * Returned tuple includes the following process info:
+ *
+ * - num_threads()
+ * - ctx_switches()
+ * - num_handles() (fallback)
+ * - cpu_times() (fallback)
+ * - create_time() (fallback)
+ * - io_counters() (fallback)
+ * - memory_info() (fallback)
+ */
+PyObject *
+psutil_proc_info(PyObject *self, PyObject *args) {
+    DWORD pid;
+    PSYSTEM_PROCESS_INFORMATION process;
+    PVOID buffer;
+    ULONG i;
+    ULONG ctx_switches = 0;
+    double user_time;
+    double kernel_time;
+    double create_time;
+    PyObject *py_retlist;
+
+    if (! PyArg_ParseTuple(args, _Py_PARSE_PID, &pid))
+        return NULL;
+    if (! psutil_get_proc_info(pid, &process, &buffer))
+        return NULL;
+
+    for (i = 0; i < process->NumberOfThreads; i++)
+        ctx_switches += process->Threads[i].ContextSwitches;
+    user_time = (double)process->UserTime.HighPart * HI_T + \
+                (double)process->UserTime.LowPart * LO_T;
+    kernel_time = (double)process->KernelTime.HighPart * HI_T + \
+                    (double)process->KernelTime.LowPart * LO_T;
+
+    // Convert the LARGE_INTEGER union to a Unix time.
+    // It's the best I could find by googling and borrowing code here
+    // and there. The time returned has a precision of 1 second.
+    if (0 == pid || 4 == pid) {
+        // the python module will translate this into BOOT_TIME later
+        create_time = 0;
+    }
+    else {
+        create_time = psutil_LargeIntegerToUnixTime(process->CreateTime);
+    }
+
+    py_retlist = Py_BuildValue(
+#if defined(_WIN64)
+        "kkdddiKKKKKK" "kKKKKKKKKK",
+#else
+        "kkdddiKKKKKK" "kIIIIIIIII",
+#endif
+        process->HandleCount,                   // num handles
+        ctx_switches,                           // num ctx switches
+        user_time,                              // cpu user time
+        kernel_time,                            // cpu kernel time
+        create_time,                            // create time
+        (int)process->NumberOfThreads,          // num threads
+        // IO counters
+        process->ReadOperationCount.QuadPart,   // io rcount
+        process->WriteOperationCount.QuadPart,  // io wcount
+        process->ReadTransferCount.QuadPart,    // io rbytes
+        process->WriteTransferCount.QuadPart,   // io wbytes
+        process->OtherOperationCount.QuadPart,  // io others count
+        process->OtherTransferCount.QuadPart,   // io others bytes
+        // memory
+        process->PageFaultCount,                // num page faults
+        process->PeakWorkingSetSize,            // peak wset
+        process->WorkingSetSize,                // wset
+        process->QuotaPeakPagedPoolUsage,       // peak paged pool
+        process->QuotaPagedPoolUsage,           // paged pool
+        process->QuotaPeakNonPagedPoolUsage,    // peak non paged pool
+        process->QuotaNonPagedPoolUsage,        // non paged pool
+        process->PagefileUsage,                 // pagefile
+        process->PeakPagefileUsage,             // peak pagefile
+        process->PrivatePageCount               // private
+    );
+
+    free(buffer);
+    return py_retlist;
 }

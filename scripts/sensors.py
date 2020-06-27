@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright (c) 2009, Giampaolo Rodola'. All rights reserved.
@@ -30,7 +30,6 @@ Battery:
 """
 
 from __future__ import print_function
-
 import psutil
 
 

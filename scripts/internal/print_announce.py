@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Copyright (c) 2009 Giampaolo Rodola'. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
@@ -40,8 +40,8 @@ running processes. It implements many functionalities offered by command \
 line tools such as: ps, top, lsof, netstat, ifconfig, who, df, kill, free, \
 nice, ionice, iostat, iotop, uptime, pidof, tty, taskset, pmap. It \
 currently supports Linux, Windows, macOS, Sun Solaris, FreeBSD, OpenBSD, \
-NetBSD and AIX, both 32-bit and 64-bit architectures, with Python versions \
-from 2.6 to 3.6. PyPy is also known to work.
+NetBSD and AIX, both 32-bit and 64-bit architectures.  Supported Python \
+versions are 2.6, 2.7 and 3.4+. PyPy is also known to work.
 
 What's new
 ==========
@@ -58,7 +58,7 @@ Links
 
 --
 
-Giampaolo - http://grodola.blogspot.com
+Giampaolo - https://gmpy.dev/about
 """
 
 

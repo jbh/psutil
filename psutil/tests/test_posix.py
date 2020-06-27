@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright (c) 2009, Giampaolo Rodola'. All rights reserved.
@@ -22,19 +22,18 @@ from psutil import MACOS
 from psutil import OPENBSD
 from psutil import POSIX
 from psutil import SUNOS
-from psutil.tests import APPVEYOR
-from psutil.tests import get_kernel_version
-from psutil.tests import get_test_subprocess
+from psutil.tests import CI_TESTING
+from psutil.tests import spawn_testproc
+from psutil.tests import HAS_NET_IO_COUNTERS
 from psutil.tests import mock
+from psutil.tests import PsutilTestCase
 from psutil.tests import PYTHON_EXE
-from psutil.tests import reap_children
-from psutil.tests import retry_before_failing
-from psutil.tests import run_test_module_by_name
+from psutil.tests import retry_on_failure
 from psutil.tests import sh
 from psutil.tests import skip_on_access_denied
+from psutil.tests import terminate
 from psutil.tests import TRAVIS
 from psutil.tests import unittest
-from psutil.tests import wait_for_pid
 from psutil.tests import which
 
 
@@ -52,14 +51,13 @@ def ps(fmt, pid=None):
     if pid is not None:
         cmd.extend(['-p', str(pid)])
     else:
-        if SUNOS:
+        if SUNOS or AIX:
             cmd.append('-A')
         else:
             cmd.append('ax')
 
     if SUNOS:
-        fmt_map = {'command', 'comm',
-                   'start', 'stime'}
+        fmt_map = set(('command', 'comm', 'start', 'stime'))
         fmt = fmt_map.get(fmt, fmt)
 
     cmd.extend(['-o', fmt])
@@ -113,19 +111,32 @@ def ps_args(pid):
     return ps(field, pid)
 
 
+def ps_rss(pid):
+    field = "rss"
+    if AIX:
+        field = "rssize"
+    return ps(field, pid)
+
+
+def ps_vsz(pid):
+    field = "vsz"
+    if AIX:
+        field = "vsize"
+    return ps(field, pid)
+
+
 @unittest.skipIf(not POSIX, "POSIX only")
-class TestProcess(unittest.TestCase):
+class TestProcess(PsutilTestCase):
     """Compare psutil results against 'ps' command line utility (mainly)."""
 
     @classmethod
     def setUpClass(cls):
-        cls.pid = get_test_subprocess([PYTHON_EXE, "-E", "-O"],
-                                      stdin=subprocess.PIPE).pid
-        wait_for_pid(cls.pid)
+        cls.pid = spawn_testproc([PYTHON_EXE, "-E", "-O"],
+                                 stdin=subprocess.PIPE).pid
 
     @classmethod
     def tearDownClass(cls):
-        reap_children()
+        terminate(cls.pid)
 
     def test_ppid(self):
         ppid_ps = ps('ppid', self.pid)
@@ -157,22 +168,22 @@ class TestProcess(unittest.TestCase):
             assert fun.called
 
     @skip_on_access_denied()
-    @retry_before_failing()
+    @retry_on_failure()
     def test_rss_memory(self):
         # give python interpreter some time to properly initialize
         # so that the results are the same
         time.sleep(0.1)
-        rss_ps = ps('rss', self.pid)
+        rss_ps = ps_rss(self.pid)
         rss_psutil = psutil.Process(self.pid).memory_info()[0] / 1024
         self.assertEqual(rss_ps, rss_psutil)
 
     @skip_on_access_denied()
-    @retry_before_failing()
+    @retry_on_failure()
     def test_vsz_memory(self):
         # give python interpreter some time to properly initialize
         # so that the results are the same
         time.sleep(0.1)
-        vsz_ps = ps('vsz', self.pid)
+        vsz_ps = ps_vsz(self.pid)
         vsz_psutil = psutil.Process(self.pid).memory_info()[1] / 1024
         self.assertEqual(vsz_ps, vsz_psutil)
 
@@ -271,60 +282,17 @@ class TestProcess(unittest.TestCase):
         psutil_nice = psutil.Process().nice()
         self.assertEqual(ps_nice, psutil_nice)
 
-    def test_num_fds(self):
-        # Note: this fails from time to time; I'm keen on thinking
-        # it doesn't mean something is broken
-        def call(p, attr):
-            args = ()
-            attr = getattr(p, name, None)
-            if attr is not None and callable(attr):
-                if name == 'rlimit':
-                    args = (psutil.RLIMIT_NOFILE,)
-                attr(*args)
-            else:
-                attr
-
-        p = psutil.Process(os.getpid())
-        failures = []
-        ignored_names = ['terminate', 'kill', 'suspend', 'resume', 'nice',
-                         'send_signal', 'wait', 'children', 'as_dict',
-                         'memory_info_ex']
-        if LINUX and get_kernel_version() < (2, 6, 36):
-            ignored_names.append('rlimit')
-        if LINUX and get_kernel_version() < (2, 6, 23):
-            ignored_names.append('num_ctx_switches')
-        for name in dir(psutil.Process):
-            if (name.startswith('_') or name in ignored_names):
-                continue
-            else:
-                try:
-                    num1 = p.num_fds()
-                    for x in range(2):
-                        call(p, name)
-                    num2 = p.num_fds()
-                except psutil.AccessDenied:
-                    pass
-                else:
-                    if abs(num2 - num1) > 1:
-                        fail = "failure while processing Process.%s method " \
-                               "(before=%s, after=%s)" % (name, num1, num2)
-                        failures.append(fail)
-        if failures:
-            self.fail('\n' + '\n'.join(failures))
-
 
 @unittest.skipIf(not POSIX, "POSIX only")
-class TestSystemAPIs(unittest.TestCase):
+class TestSystemAPIs(PsutilTestCase):
     """Test some system APIs."""
 
-    @retry_before_failing()
+    @retry_on_failure()
     def test_pids(self):
         # Note: this test might fail if the OS is starting/killing
         # other processes in the meantime
-        pids_ps = ps("pid")
+        pids_ps = sorted(ps("pid"))
         pids_psutil = psutil.pids()
-        pids_ps.sort()
-        pids_psutil.sort()
 
         # on MACOS and OPENBSD ps doesn't show pid 0
         if MACOS or OPENBSD and 0 not in pids_ps:
@@ -341,6 +309,7 @@ class TestSystemAPIs(unittest.TestCase):
     @unittest.skipIf(SUNOS, "unreliable on SUNOS")
     @unittest.skipIf(TRAVIS, "unreliable on TRAVIS")
     @unittest.skipIf(not which('ifconfig'), "no ifconfig cmd")
+    @unittest.skipIf(not HAS_NET_IO_COUNTERS, "not supported")
     def test_nic_names(self):
         output = sh("ifconfig -a")
         for nic in psutil.net_io_counters(pernic=True).keys():
@@ -352,12 +321,12 @@ class TestSystemAPIs(unittest.TestCase):
                     "couldn't find %s nic in 'ifconfig -a' output\n%s" % (
                         nic, output))
 
-    # can't find users on APPVEYOR or TRAVIS
-    @unittest.skipIf(APPVEYOR or TRAVIS and not psutil.users(),
-                     "unreliable on APPVEYOR or TRAVIS")
-    @retry_before_failing()
+    @unittest.skipIf(CI_TESTING and not psutil.users(), "unreliable on CI")
+    @retry_on_failure()
     def test_users(self):
         out = sh("who")
+        if not out.strip():
+            raise self.skipTest("no users on this system")
         lines = out.split('\n')
         users = [x.split()[0] for x in lines]
         terminals = [x.split()[1] for x in lines]
@@ -437,4 +406,5 @@ class TestSystemAPIs(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    run_test_module_by_name(__file__)
+    from psutil.tests.runner import run_from_name
+    run_from_name(__file__)

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Copyright (c) 2009, Giampaolo Rodola'. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
@@ -27,7 +27,6 @@ binpath: C:\Windows\system32\svchost.exe -k LocalServiceAndNoImpersonation
 Appinfo (Application Information)
 status: stopped, start: manual, username: LocalSystem, pid: None
 binpath: C:\Windows\system32\svchost.exe -k netsvcs
-
 ...
 """
 
