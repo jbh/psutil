@@ -16,6 +16,7 @@ sensors) in Python. Supported platforms:
  - NetBSD
  - Sun Solaris
  - AIX
+ - IBM i
 
 Works with Python versions from 2.6 to 3.4+.
 """
