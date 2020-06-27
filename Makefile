@@ -8,7 +8,6 @@ ARGS =
 TSCRIPT = psutil/tests/runner.py
 
 # Internal.
-SYSTEM = $(shell uname)
 DEPS = \
 	argparse \
 	check-manifest \
@@ -22,10 +21,6 @@ DEPS = \
 	twine \
 	virtualenv \
 	wheel
-ifeq ($(SYSTEM), OS400)
-DEPS += \
-	ibm_db
-endif
 PY2_DEPS = \
 	futures \
 	ipaddress \
@@ -83,9 +78,6 @@ build: _  ## Compile (in parallel) without installing.
 
 install:  ## Install this package as current user in "edit" mode.
 	# make sure setuptools is installed (needed for 'develop' / edit mode)
-	$(info $$DEPS is [${DEPS}])
-	$(info $$SYSTEM is [${SYSTEM}])
-	$(SYSTEM)
 	$(PYTHON) -c "import setuptools"
 	${MAKE} build
 	PYTHONWARNINGS=all $(PYTHON) setup.py develop $(INSTALL_OPTS)
